@@ -1,0 +1,61 @@
+#!/bin/sh -e
+#
+# 2020,2022 Dennis Camera (cdist at dtnr.ch)
+#
+# This file is part of cdist.
+#
+# cdist is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# cdist is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with cdist. If not, see <http://www.gnu.org/licenses/>.
+#
+# Determine and print the path of the --tz zoneinfo file.
+# If the zone is invalid, the explorer produces empty output.
+#
+
+TZ=$(cat "${__object:?}/parameter/tz")
+
+if test -s "${__object:?}/parameter/tzdir"
+then
+	TZDIR=$(cat "${__object:?}/parameter/tzdir")
+
+	test -d "${TZDIR}" || {
+		printf 'Invalid --tzdir: no such directory: %s\n' "${TZDIR}" >&2
+		exit 1
+	}
+else
+	case $(uname -s)
+	in
+		(Darwin)
+			TZDIR=/var/db/timezone/zoneinfo
+			;;
+		(SunOS)
+			TZDIR=/usr/share/lib/zoneinfo
+			;;
+		(*)
+			# According to glibc's tzfile(5) there are two typical directories:
+			if test -d /usr/share/zoneinfo
+			then
+				# Linux, FreeBSD, OpenBSD, NetBSD. And others?
+				TZDIR=/usr/share/zoneinfo
+			elif test -d /usr/lib/zoneinfo
+			then
+				# Old libc4, libc5 apparently.
+				TZDIR=/usr/lib/zoneinfo
+			fi
+			;;
+	esac
+fi
+
+if test -n "${TZDIR}" -a -e "${TZDIR}/${TZ}"
+then
+	echo "${TZDIR}/${TZ}"
+fi

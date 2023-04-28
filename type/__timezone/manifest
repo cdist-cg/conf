@@ -3,6 +3,7 @@
 # 2011 Ramon Salvadó (rsalvado at gnuine dot com)
 # 2012-2015 Steven Armstrong (steven-cdist at armstrong.cc)
 # 2012-2019 Nico Schottelius (nico-cdist at schottelius.org)
+# 2020,2022 Dennis Camera (cdist at dtnr.ch)
 #
 # This file is part of cdist.
 #
@@ -22,45 +23,194 @@
 #
 # This type allows to configure the desired localtime timezone.
 
-timezone=$(cat "$__object/parameter/tz")
-os=$(cat "$__global/explorer/os")
+TZ=$(cat "${__object:?}/parameter/tz")
+os=$(cat "${__global:?}/explorer/os")
+localtime_file=/etc/localtime
+zoneinfo_file=$(cat "${__object:?}/explorer/zoneinfo_file")
 
-case "$os" in
-    archlinux|debian|ubuntu|devuan|alpine)
-        __package tzdata
-        export require="__package/tzdata"
-    ;;
-    suse)
-        __package timezone
-        export require="__package/timezone"
-    ;;
-    freebsd|netbsd|openbsd)
-        # whitelist
-        :
-    ;;
-    coreos)
-        # whitelist
-        :
-    ;;
-    scientific|centos)
-        __package tzdata --state present
-        export require="__package/tzdata"
-        __file /etc/sysconfig/clock \
-            --owner root --group root --mode 644 \
-            --state exists
-        require="__file/etc/sysconfig/clock" \
-            __key_value ZONE \
-                --file /etc/sysconfig/clock \
-                --delimiter '=' \
-                --value "\"$timezone\""
-    ;;
-    *)
-        echo "Your operating system ($os) is currently not supported by this type (${__type##*/})." >&2
-        echo "Please contribute an implementation for it if you can." >&2
-        exit 1
-    ;;
+canonicalize_path() {
+	# NOTE: Only works for absolute paths
+	# shellcheck disable=SC2016
+	printf '%s\n' "${1:?}" \
+	| tr '/' '\n' \
+	| sed -n -e '
+	    # ignore empty lines (produced by // in original path and leading /)
+	    /^$/bq
+		# ignore /./ components
+	    /^\.$/bq
+		# drop a component from the "stack" if a .. is met
+	    /^\.\.$/{
+	      # delete last line from hold space
+	      x
+	      s/^\(.*\)\n.*$/\1/
+	      x
+	      bq
+	    }
+	    # push component to "stack" (append to hold space)
+	    H
+	    :q
+	    # print stack contents (hold space) at the end
+	    ${x;p;}' \
+	| sed -n -e 'H;${g;s/^\n//;s/\n/\//g;p;}'
+}
+
+count_path_components() (
+	components=$(canonicalize_path "$1")
+	IFS=/
+	# shellcheck disable=SC2048,SC2086
+	set -f -- ${components#/}
+	echo $#
+)
+
+backdirs() {
+	test "${1:-0}" -gt 0 || { printf './\n'; return 0; }
+	until test "${1:-0}" -le 0
+	do
+		printf '../'
+		set -- $(($1 - 1))
+	done
+	printf '\n'
+}
+
+invalid_timezone() {
+	# NOTE: When the tzdata package was just installed, this might produce an
+	# invalid timezone error because the explorer has been run before the
+	# installation.
+	printf 'Invalid timezone: %s\n' "${TZ}" >&2
+	exit 1
+}
+
+# Some OSes require a timezone package to be installed first:
+case ${os}
+in
+	(archlinux|alpine|debian|devuan|ubuntu|centos|redhat|scientific|voidlinux)
+		__package tzdata
+		export require=__package/tzdata
+		;;
+	(gentoo)
+		__package sys-libs/timezone-data
+		export require=__package/sys-libs/timezone-data
+		;;
+	(suse)
+		__package timezone
+		export require=__package/timezone
+		;;
+	(slackware)
+		__package glibc-zoneinfo
+		export require=__package/glibc-zoneinfo
+		;;
 esac
 
-__link /etc/localtime \
-    --source "/usr/share/zoneinfo/${timezone}" \
-    --type symbolic
+# Configure the timezone
+case ${os}
+in
+	(alpine|coreos|debian|devuan|ubuntu)
+		test -n "${zoneinfo_file}" || invalid_timezone
+
+		__file /etc/timezone --source - <<-EOF
+		${TZ}
+		EOF
+		;;
+	(centos|redhat|scientific)
+		test -n "${zoneinfo_file}" || invalid_timezone
+
+		__file /etc/sysconfig/clock \
+			--owner root --group root --mode 644 \
+			--state exists
+		require=__file/etc/sysconfig/clock \
+		__key_value /etc/sysconfig/clock:ZONE \
+			--file /etc/sysconfig/clock \
+			--key ZONE \
+			--delimiter '=' --exact_delimiter \
+			--value "\"${TZ}\""
+		;;
+	(gentoo)
+		test -n "${zoneinfo_file}" || invalid_timezone
+
+		# XXX: systemd?
+
+		echo "${TZ}" | __file /etc/timezone --owner 0 --group 0 --mode 0644 \
+			--source -
+
+		# XXX: Should /etc/TZ be updated??
+		__file /etc/TZ \
+			--owner 0 --group 0 --mode 0644 \
+			--source - <<-EOF
+		${TZ}
+		EOF
+		;;
+	(freebsd)
+		test -n "${zoneinfo_file}" || invalid_timezone
+
+		__file /var/db/zoneinfo \
+			--owner 0 --group 0 --mode 0644 \
+			--source - <<-EOF
+		${TZ}
+		EOF
+		;;
+	(openwrt)
+		tzdata=$(awk -F'\t' -v TZ="${TZ}" '$1==TZ{print $2}' \
+			"${__type:?}/files/openwrt/tzdata.tsv")
+
+		test -n "${tzdata}" || invalid_timezone
+
+		__uci system.@system[0].zonename --value "${TZ}"
+			# --transaction timezone
+		__uci system.@system[0].timezone --value "${tzdata}"
+			# --transaction timezone
+
+		if test -n "${zoneinfo_file}"
+		then
+			localtime_file=/tmp/localtime
+			__file /tmp/TZ --state absent
+		else
+			__file /tmp/TZ \
+				 --source - <<-EOF
+			${tzdata}
+			EOF
+
+			# NOTE: Skip creation of localtime link, since timezones are not
+			#       installed on target.
+			exit 0
+		fi
+		;;
+	(suse)
+		if test -s "${__global:?}/explorer/os_release"
+		then
+			# shellcheck source=cdist/conf/explorer/os_release
+			os_version=$(. "${__global:?}/explorer/os_release" && echo "${VERSION}")
+		else
+			os_version=$(sed -n 's/^VERSION\ *=\ *//p' "${__global:?}/explorer/os_version")
+		fi
+		os_major=$(expr "${os_version}" : '\([0-9]\{1,\}\)')
+
+		# XXX: Consider using `yast2 timezone ...` instead
+		if expr "${os_major}" \< 15 \| "${os_major}" = 42
+		then
+			# It seems that starting with SuSE 15 /etc/sysconfig/clock is
+			# abandoned.  The file still exists but only contains a
+			# DEFAULT_TIMEZONE entry.
+			__key_value /etc/sysconfig/clock:TIMEZONE \
+				--file /etc/sysconfig/clock \
+				--delimiter '=' --exact_delimiter \
+				--key TIMEZONE --value "\"${TZ}\""
+		fi
+		;;
+	(voidlinux)
+		test -n "${zoneinfo_file}" || invalid_timezone
+
+		__key_value /etc/rc.conf:TIMEZONE \
+			--file /etc/rc.conf \
+			--key TIMEZONE \
+			--delimiter '=' --exact_delimiter \
+			--value "\"${TZ}\""
+		;;
+	(*)
+		echo "Your operating system (${os}) is currently not supported by this type (${__type##*/})." >&2
+		echo "Please contribute an implementation for it if you can." >&2
+		exit 1
+		;;
+esac
+
+rel_zoneinfo_file="$(backdirs "$(count_path_components "${localtime_file%/*}")")${zoneinfo_file#/}"
+__link "${localtime_file}" --type symbolic --source "${rel_zoneinfo_file}"
