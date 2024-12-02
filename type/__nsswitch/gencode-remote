@@ -1,0 +1,113 @@
+#!/bin/sh -e
+#
+# 2023 Dennis Camera (dennis.camera at riiengineering.ch)
+#
+# This file is part of skonfig-base.
+#
+# skonfig-base is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# skonfig-base is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with skonfig-base. If not, see <http://www.gnu.org/licenses/>.
+#
+
+join_lines(){
+	awk -v sep="$1" 'NR>1{printf "%s",sep}{printf "%s",$0}END{printf ORS}'
+}
+
+if
+	join_lines ' ' <"${__object:?}/parameter/source" \
+	| cmp -s "${__object:?}/explorer/sources" -
+then
+	# no changes needed
+	exit 0
+fi
+
+
+if ! test -s "${__object:?}/explorer/sources"
+then
+	# possibly the file does not exist
+	cat <<'EOF'
+test -f /etc/nsswitch.conf || (
+	umask 0022
+	:>/etc/nsswitch.conf
+	chown 0:0 /etc/nsswitch.conf
+)
+
+EOF
+fi
+
+# update nsswitch.conf(5)
+
+# NOTE: the updated content is cat(1) into /etc/nsswitch.conf to achieve the
+#       correct behaviour if /etc/nsswitch.conf is a symbolic link.
+cat <<'EOF'
+awk -v db_name="${__object_id:?}" -v source_file="${__object:?}/parameter/source" '
+function get_indent(    i) {
+	# FIXME: handle tab stops?
+	i = index($0, $1) - 1
+	i += length($1)
+	i += index(substr($0, i+1), $2) - 1
+	return i
+}
+function guess_indent(key,    cnt, il, i) {
+	# set initial cnt = 2 to ignore indentations which only occur once
+	il = (length(key) + 2); cnt = 2
+
+	for (i in indent) {
+		if (indent[i] > cnt) { il = i }
+	}
+	return il
+}
+
+BEGIN {
+	while (0 < (getline src < source_file)) {
+		sources = sources (sources ? " " : "") src
+	}
+	close(source_file)
+}
+
+$1 ~ /^[^#].*:/ {
+	# looks like an entry
+	db = substr($1, 1, index($1, ":") - 1)
+
+	i = get_indent()
+	if (i > (index($0, $1) + length($1))) {
+		# only remember if there is more than one space between db and sources
+		indent[i]++
+	}
+}
+
+db == db_name {
+	if (!f) {
+		# only replace the first occurrence
+		if (sources) {
+			match($0, /:[ \t]*/)
+			printf "%s%s" ORS, substr($0, 1, RSTART + RLENGTH - 1), sources
+		}
+		f = 1
+	}
+
+	while (/\\$/) { getline }
+	next
+}
+
+{ print }
+
+END {
+	if (!f && sources) {
+		# append new entry
+		printf ("%-" guess_indent(db_name) "s%s" ORS), db_name ":", sources
+	}
+}
+' /etc/nsswitch.conf >/etc/nsswitch.conf.tmp \
+&& cat /etc/nsswitch.conf.tmp >/etc/nsswitch.conf
+rm -f /etc/nsswitch.conf.tmp
+EOF
